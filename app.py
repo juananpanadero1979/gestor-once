@@ -2,33 +2,47 @@ import streamlit as st
 import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 import time
 
-# --- 1. CONFIGURACIÓN E INICIALIZACIÓN ---
 st.set_page_config(page_title="GESTOR PRO ONCE", page_icon="🟢", layout="wide")
 
-# Conexión a Google Sheets
+# --- 1. CONEXIÓN BLINDADA ---
 @st.cache_resource
 def conectar_google_sheets():
     try:
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        # Cargamos credenciales
         creds_dict = dict(st.secrets["gcp_service_account"])
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
+        
+        # Intentamos abrir la hoja
         sheet = client.open("GESTOR_ONCE_DB") 
-        return sheet
+        return sheet, creds.service_account_email
+    except gspread.SpreadsheetNotFound:
+        st.error("❌ NO ENCUENTRO EL ARCHIVO 'GESTOR_ONCE_DB'")
+        st.info("Asegúrate de haber creado una hoja con ese nombre EXACTO en tu Google Drive.")
+        return None, None
     except Exception as e:
-        st.error(f"⚠️ Error de conexión: {e}")
-        return None
+        st.error(f"❌ ERROR DE CONEXIÓN: {e}")
+        return None, None
 
-SHEET = conectar_google_sheets()
+SHEET, EMAIL_ROBOT = conectar_google_sheets()
 
-# --- 2. CONSTRUCTOR DE BASE DE DATOS (AUTO-UPDATE) ---
-def auto_construir_db():
-    if not SHEET: return
-    # Definimos la estructura exacta que has pedido
-    estructura = {
+# --- 2. DIAGNÓSTICO INICIAL (¡ESTO ES NUEVO!) ---
+if not SHEET:
+    st.stop() # Si no hay hoja, paramos aquí
+
+# Mostramos el estado de la conexión para que veas si está bien
+with st.expander("🔧 ESTADO DE LA CONEXIÓN (Abre si tienes errores)"):
+    st.write(f"🤖 **Soy el Robot:** `{EMAIL_ROBOT}`")
+    st.write("✅ He encontrado el archivo `GESTOR_ONCE_DB`")
+    st.info("👆 COPIA ese correo y asegúrate de que está compartido como EDITOR en tu Google Sheet.")
+
+# --- 3. CONSTRUCTOR DE BASE DE DATOS (REPARADO) ---
+def chequear_y_construir():
+    estruc = {
         "Perfil": ["ID_Vendedor", "Nombre", "Tipo", "AnoVenta", "Vacaciones"],
         "StockPapel": ["FechaEntrada", "Producto", "SerieInicio", "SerieFin", "Cantidad", "ImportePaquete", "Estado"],
         "Rascas": ["Juego", "CodigoBarras", "Estado", "FechaEntrada", "FechaActivacion", "FechaLimiteVenta", "FechaCaducidadStock"],
@@ -37,231 +51,130 @@ def auto_construir_db():
         "Agenda": ["Fecha", "Tipo", "Nota", "FotoEvidence"]
     }
     
-    try:
-        for pestana, cols in estructura.items():
+    # Botón de emergencia por si faltan pestañas
+    if st.button("🛠️ REPARAR / CREAR BASE DE DATOS"):
+        barra = st.progress(0)
+        idx = 0
+        for pestana, columnas in estruc.items():
             try:
-                ws = SHEET.worksheet(pestana)
-                if len(ws.row_values(1)) == 0: ws.append_row(cols)
-            except:
-                ws = SHEET.add_worksheet(title=pestana, rows=100, cols=15)
-                ws.append_row(cols)
-                time.sleep(1)
-    except Exception as e:
-        st.warning("Verificando estructura DB...")
+                try:
+                    ws = SHEET.worksheet(pestana)
+                except:
+                    ws = SHEET.add_worksheet(title=pestana, rows=100, cols=20)
+                
+                # Si está vacía, ponemos cabeceras
+                if not ws.get_all_values():
+                    ws.append_row(columnas)
+                
+            except Exception as e:
+                st.error(f"Error creando {pestana}: {e}")
+            
+            idx += 1
+            barra.progress(idx / len(estruc))
+        st.success("✅ Base de datos reparada. Recarga la página.")
+        time.sleep(2)
+        st.rerun()
 
-if SHEET: auto_construir_db()
+chequear_y_construir()
 
-# --- 3. FUNCIONES DE INTELIGENCIA (LÓGICA ONCE) ---
-
-def calcular_alertas_rascas(df_rascas):
-    """Analiza caducidades según tus reglas de 30 días y 3 meses"""
-    alertas = []
-    hoy = pd.Timestamp.now()
-    
-    for _, row in df_rascas.iterrows():
-        # Regla 1: Stock (3 meses para vender desde entrada)
-        if row['Estado'] == 'STOCK':
-            fecha_ent = pd.to_datetime(row['FechaEntrada'], errors='coerce')
-            if not pd.isna(fecha_ent):
-                dias_pasados = (hoy - fecha_ent).days
-                # Aviso al 2º mes (60 días)
-                if dias_pasados >= 60 and dias_pasados < 90:
-                    alertas.append(f"⚠️ URGENTE: El libro {row['Juego']} lleva 2 meses en el bolso.")
-                elif dias_pasados >= 90:
-                    alertas.append(f"⛔ CADUCADO: El libro {row['Juego']} ha superado los 3 meses en stock.")
-
-        # Regla 2: Activado (30 días para vender)
-        if row['Estado'] == 'ACTIVADO':
-            fecha_act = pd.to_datetime(row['FechaActivacion'], errors='coerce')
-            if not pd.isna(fecha_act):
-                dias_act = (hoy - fecha_act).days
-                restantes = 30 - dias_act
-                if restantes <= 7 and restantes > 0:
-                    alertas.append(f"⏳ ALERTA: Quedan {restantes} días para vender el {row['Juego']} activado.")
-                elif restantes <= 0:
-                    alertas.append(f"⛔ RETIRAR: El {row['Juego']} ha superado los 30 días activado.")
-    return alertas
-
-def obtener_asignacion(tipo, dia_semana):
-    # Lógica hardcodeada para Tipo 4 según tu petición
-    if "Tipo 4" in tipo:
-        if dia_semana in [0, 1]: return 40 # L-M
-        if dia_semana in [2, 3]: return 60 # X-J
-        if dia_semana == 4: return 80      # V
-        return 60                          # S-D
-    return 0 # Otros tipos
-
-# Funciones CRUD rápidas
-def leer(hoja): return pd.DataFrame(SHEET.worksheet(hoja).get_all_records()) if SHEET else pd.DataFrame()
-def escribir(hoja, lista): SHEET.worksheet(hoja).append_row(lista) if SHEET else None
-def actualizar_estado(hoja, col_busqueda, valor_busqueda, col_editar, nuevo_valor):
+# --- 4. FUNCIONES AUXILIARES ---
+def leer(hoja):
     try:
-        ws = SHEET.worksheet(hoja)
-        cell = ws.find(valor_busqueda)
-        ws.update_cell(cell.row, col_editar, nuevo_valor)
+        return pd.DataFrame(SHEET.worksheet(hoja).get_all_records())
+    except:
+        return pd.DataFrame()
+
+def escribir(hoja, lista):
+    try:
+        SHEET.worksheet(hoja).append_row(lista)
         return True
-    except: return False
+    except Exception as e:
+        st.error(f"Error escribiendo en {hoja}: {e}")
+        return False
 
-# --- 4. INTERFAZ GRÁFICA (ERP) ---
+# --- 5. INTERFAZ GRÁFICA ---
 
-st.title("📱 GESTOR PRO ONCE v5.0")
-if not SHEET: st.stop()
+st.title("📱 GESTOR PRO ONCE v5.1")
 
-# Menú Principal
-pestana = st.sidebar.radio("Navegación ERP", 
-    ["1. Perfil", "2. Almacén General", "3. Almacén Rascas", "4. TPV Diario", "5. Extras", "6. Informes", "7. Agenda"])
+# Menú Seguro (No falla si falta la hoja)
+pestana = st.sidebar.radio("Navegación", 
+    ["1. Perfil", "2. Almacén General", "3. Almacén Rascas", "4. TPV Diario", "5. Extras", "7. Agenda"])
 
 # --- PESTAÑA 1: PERFIL ---
 if pestana == "1. Perfil":
-    st.header("👤 Configuración Vendedor")
+    st.header("👤 Configuración")
+    
+    try:
+        ws = SHEET.worksheet("Perfil")
+        # Leemos datos actuales
+        datos = ws.get_all_records()
+        valores_actuales = datos[0] if datos else {}
+    except:
+        st.warning("⚠️ La pestaña 'Perfil' no existe o está vacía. Pulsa el botón 'REPARAR' arriba.")
+        st.stop()
+
     with st.form("perfil"):
         c1, c2 = st.columns(2)
-        nombre = c1.text_input("Nombre y Apellidos")
-        id_vend = c2.text_input("ID Vendedor")
-        tipo = st.selectbox("Tipo Vendedor", ["Tipo 4 (X-D)", "Tipo 1 (Jornada)", "Tipo Fin de Semana"])
-        ano = st.number_input("Año de Venta", value=2024)
-        if st.form_submit_button("Guardar Perfil"):
-            # Borramos anterior y ponemos nuevo
-            ws = SHEET.worksheet("Perfil")
-            if len(ws.get_all_values()) > 1: ws.delete_rows(2)
-            escribir("Perfil", [id_vend, nombre, tipo, ano, ""])
-            st.success("Perfil actualizado. Calendarios sincronizados.")
+        nombre = c1.text_input("Nombre", value=valores_actuales.get("Nombre", ""))
+        id_vend = c2.text_input("ID Vendedor", value=valores_actuales.get("ID_Vendedor", ""))
+        tipo = st.selectbox("Tipo", ["Tipo 4 (X-D)", "Tipo 1 (Jornada)", "Tipo Fin de Semana"])
+        ano = st.number_input("Año", value=2024)
+        
+        if st.form_submit_button("Guardar"):
+            # Limpiamos y reescribimos
+            ws.clear()
+            ws.append_row(["ID_Vendedor", "Nombre", "Tipo", "AnoVenta", "Vacaciones"])
+            ws.append_row([id_vend, nombre, tipo, ano, ""])
+            st.success("Perfil Guardado")
 
-# --- PESTAÑA 2: ALMACÉN GENERAL ---
+# --- PESTAÑA 2: ALMACÉN ---
 elif pestana == "2. Almacén General":
-    st.header("📦 Entrada de Paquete Semanal")
-    
-    c1, c2, c3 = st.columns(3)
-    fecha_paq = c1.date_input("Fecha Retirada", date.today())
-    importe_paq = c2.number_input("Importe Total Paquete (€)", value=0.0)
-    
-    with st.expander("➕ Desglose de Productos"):
-        prod = st.selectbox("Producto", ["Cupón Diario", "Cuponazo", "Sueldazo"])
-        serie_ini = st.text_input("Serie Inicio")
-        serie_fin = st.text_input("Serie Fin")
-        cant = st.number_input("Cantidad", value=50)
-        
-        if st.button("Registrar Línea de Stock"):
-            escribir("StockPapel", [str(fecha_paq), prod, serie_ini, serie_fin, cant, importe_paq, "ALMACEN"])
-            st.success(f"Añadido: {prod} ({cant} ud)")
-
-# --- PESTAÑA 3: RASCAS (LÓGICA AVANZADA) ---
-elif pestana == "3. Almacén Rascas":
-    st.header("🎟️ Gestión de Instantánea")
-    
-    # ALERTAS INTELIGENTES
-    df_rascas = leer("Rascas")
-    if not df_rascas.empty:
-        alertas = calcular_alertas_rascas(df_rascas)
-        if alertas:
-            st.error("🔔 AVISOS DE CADUCIDAD")
-            for a in alertas: st.write(a)
-    
-    tab_a, tab_b = st.tabs(["Alta Stock", "Gestión Activos"])
-    
-    with tab_a:
-        c1, c2 = st.columns(2)
-        juego = c1.selectbox("Juego", ["Mega Millonario", "7 y Media", "Monopoly"])
-        cod = c2.text_input("Código Barras Libro")
-        if st.button("📥 Recepcionar (Empiezan los 3 meses)"):
-            fecha_caducidad = date.today() + timedelta(days=90) # Regla 3 meses
-            escribir("Rascas", [juego, cod, "STOCK", str(date.today()), "", "", str(fecha_caducidad)])
-            st.success("Libro en Stock. Cuenta atrás iniciada.")
-            
-    with tab_b:
-        st.subheader("En Bolso (Stock)")
-        if not df_rascas.empty:
-            stock = df_rascas[df_rascas["Estado"] == "STOCK"]
-            st.dataframe(stock[["Juego", "CodigoBarras", "FechaEntrada"]])
-            
-            act_cod = st.text_input("Escanear para ACTIVAR (Empiezan 30 días):")
-            if st.button("🔓 ACTIVAR AHORA"):
-                # Actualizamos Estado, FechaActivacion y FechaLimiteVenta
-                ws = SHEET.worksheet("Rascas")
-                try:
-                    cell = ws.find(act_cod)
-                    ws.update_cell(cell.row, 3, "ACTIVADO") # Col 3 Estado
-                    ws.update_cell(cell.row, 5, str(date.today())) # Col 5 FechaAct
-                    ws.update_cell(cell.row, 6, str(date.today() + timedelta(days=30))) # Col 6 Limite
-                    st.success("Libro Activado. Tienes 30 días.")
-                    st.rerun()
-                except: st.error("Libro no encontrado")
-
-# --- PESTAÑA 4: TPV DIARIO ---
-elif pestana == "4. TPV Diario":
-    st.header("💰 Gestión de Caja")
-    
-    col_fecha, col_foto = st.columns([2,1])
-    fecha_venta = col_fecha.date_input("Fecha de Venta", date.today())
-    foto = col_foto.file_uploader("📷 FOTO RESUMEN TPV")
-    
-    st.markdown("---")
-    
-    # Lógica de cálculo papel
-    asignacion = 60 # Por defecto, deberíamos leer del perfil
-    devolucion = st.number_input("Devoluciones Papel (Cant.)", min_value=0)
-    precio_papel = 2.0 # Esto se puede automatizar según día
-    
-    venta_papel_calc = (asignacion - devolucion) * precio_papel
-    st.info(f"Venta Papel (Calculada): {venta_papel_calc} €")
-    
+    st.header("📦 Entrada Paquete")
     c1, c2 = st.columns(2)
-    venta_tpv = c1.number_input("Venta TPV (€)")
-    premios = c2.number_input("Premios Pagados (€)")
-    tarjeta = c1.number_input("Tarjeta (€)")
-    rascas_vend = c2.number_input("Rascas Vendidos (€)")
+    fecha = c1.date_input("Fecha", date.today())
+    importe = c2.number_input("Importe Paquete (€)", 0.0)
     
-    bolsillo_real = (venta_papel_calc + venta_tpv + rascas_vend) - (premios + tarjeta)
+    with st.expander("➕ Añadir Producto"):
+        prod = st.selectbox("Producto", ["Cupón Diario", "Cuponazo", "Sueldazo"])
+        cant = st.number_input("Cantidad", 50)
+        if st.button("Registrar"):
+            escribir("StockPapel", [str(fecha), prod, "", "", cant, importe, "ALMACEN"])
+            st.success("Guardado")
+
+# --- PESTAÑA 3: RASCAS ---
+elif pestana == "3. Almacén Rascas":
+    st.header("🎟️ Rascas")
     
-    st.metric("DINERO EN BOLSILLO", f"{bolsillo_real:.2f} €")
+    tab1, tab2 = st.tabs(["Alta", "Activos"])
+    with tab1:
+        juego = st.selectbox("Juego", ["Mega Millonario", "7 y Media", "Monopoly"])
+        cod = st.text_input("Código Barras")
+        if st.button("Recepcionar"):
+             # Calculamos 90 días para caducidad
+             caducidad = date.today() + timedelta(days=90)
+             escribir("Rascas", [juego, cod, "STOCK", str(date.today()), "", "", str(caducidad)])
+             st.success("Libro registrado")
+             
+    with tab2:
+        df = leer("Rascas")
+        if not df.empty:
+            st.dataframe(df)
+            act = st.text_input("Escanear para ACTIVAR")
+            if st.button("Activar Libro"):
+                try:
+                    ws = SHEET.worksheet("Rascas")
+                    cell = ws.find(act)
+                    ws.update_cell(cell.row, 3, "ACTIVADO")
+                    st.success("Activado")
+                except:
+                    st.error("No encontrado")
+
+# --- PESTAÑA 4: TPV ---
+elif pestana == "4. TPV Diario":
+    st.header("💰 Cierre Diario")
+    v_tpv = st.number_input("Venta TPV")
+    bolsillo = st.number_input("Bolsillo Real")
     
-    if st.button("🔒 CERRAR CAJA"):
-        tiene_foto = "SI" if foto else "NO"
-        escribir("DiarioTPV", [str(fecha_venta), venta_papel_calc, venta_tpv, premios, tarjeta, rascas_vend, bolsillo_real, tiene_foto])
+    if st.button("Cerrar Caja"):
+        escribir("DiarioTPV", [str(date.today()), 0, v_tpv, 0, 0, 0, bolsillo, "NO"])
         st.balloons()
-        st.success("Cierre guardado correctamente.")
-
-# --- PESTAÑA 5: EXTRAS ---
-elif pestana == "5. Extras":
-    st.header("🌟 Sorteos Extraordinarios")
-    
-    st.info("Contabilidad separada de la caja diaria.")
-    
-    with st.expander("Nuevo Extra"):
-        extra_nom = st.text_input("Nombre (Ej: 11 del 11)")
-        cant_rec = st.number_input("Recibidos", 100)
-        precio_ext = st.number_input("Precio", 5.0)
-        if st.button("Crear Evento"):
-            escribir("Extras", [extra_nom, cant_rec, 0, precio_ext, 0, "ACTIVO"])
-            
-    st.subheader("Liquidación de Extra")
-    df_extras = leer("Extras")
-    if not df_extras.empty:
-        pendientes = df_extras[df_extras["Estado"] == "ACTIVO"]
-        evento = st.selectbox("Selecciona Sorteo", pendientes["Sorteo"].unique())
-        
-        datos_evento = pendientes[pendientes["Sorteo"] == evento].iloc[0]
-        
-        st.write(f"Recibidos: {datos_evento['CantidadRecibida']}")
-        devueltos = st.number_input("Cupones DEVUELTOS", min_value=0)
-        
-        vendidos = int(datos_evento['CantidadRecibida']) - devueltos
-        a_ingresar = vendidos * float(datos_evento['Precio'])
-        
-        st.metric("A INGRESAR (DEUDA EXTRA)", f"{a_ingresar} €")
-        
-        if st.button("Liquidar Extra"):
-            # En una app real actualizaríamos la fila, aquí añadimos registro
-            st.success("Extra liquidado y archivado.")
-
-# --- PESTAÑA 7: AGENDA (Simplificada) ---
-elif pestana == "7. Agenda":
-    st.header("🗓️ Diario de Ruta")
-    
-    fecha_nota = st.date_input("Fecha")
-    nota = st.text_area("Incidencia / Nota")
-    foto_incidencia = st.file_uploader("Adjuntar Foto Incidencia")
-    
-    if st.button("Guardar Nota"):
-        escribir("Agenda", [str(fecha_nota), "NOTA", nota, "SI" if foto_incidencia else "NO"])
-        st.success("Nota guardada en la nube.")
