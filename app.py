@@ -178,3 +178,4 @@ elif pestana == "4. TPV Diario":
     if st.button("Cerrar Caja"):
         escribir("DiarioTPV", [str(date.today()), 0, v_tpv, 0, 0, 0, bolsillo, "NO"])
         st.balloons()
+        
